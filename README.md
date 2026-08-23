@@ -160,7 +160,7 @@ AMI originate accepted; waiting for AudioSocket
 AudioSocket connected: ...
 ```
 
-AMIのログインとOriginate応答は内部で `Response: Success` と `ActionID` を検証します。失敗時やAudioSocket切断時は指数バックオフ付きで最大5回まで再試行します。Discordの送受信処理が停止した場合も、音声接続全体を最大5回まで再作成します。上限へ到達した場合は、設定を直してコンテナを再起動してください。
+AMIのログインとOriginate応答は内部で `Response: Success` と `ActionID` を検証します。失敗時やAudioSocket切断時は指数バックオフ付きで最大5回まで再試行します。Discordの送受信処理が停止した場合も、音声接続全体を最大5回まで再作成します。上限へ到達するとサーキットブレーカーが5分間再試行を停止し、その後に新しい復旧系列を開始します。
 
 Botが対象ボイスチャンネルへ参加し、Asteriskの内線 `160` へ参加した端末と双方向に音声が届くことを確認してください。
 
@@ -207,9 +207,9 @@ docker compose exec asterisk asterisk -rx 'dialplan show discord@default'
 * Asterisk→Discordが届かない場合は、BotのSpeak権限とAsterisk側のAudioSocket接続を確認します。
 * `AMI originate accepted; waiting for AudioSocket` の後に接続されない場合は、AMI OriginateまたはAsteriskのdialplan設定を確認します。
 
-### 復旧試行が上限へ到達する
+### サーキットブレーカーが作動する
 
-`Discord voice recovery exhausted` または `AMI recovery exhausted` が表示された場合、無制限な再接続や発呼を防ぐため自動復旧を停止しています。直前に出力されたエラーとDiscord権限、AMI設定、dialplanを確認し、原因を修正してからブリッジコンテナを再起動してください。
+`Discord voice circuit breaker open` または `AMI circuit breaker open` が表示された場合、短周期の再接続や発呼を防ぐため自動復旧を5分間停止しています。直前に出力されたエラーとDiscord権限、AMI設定、dialplanを確認してください。原因が解消されれば次の復旧系列で自動的に再接続します。
 
 ## 開発時の検証
 

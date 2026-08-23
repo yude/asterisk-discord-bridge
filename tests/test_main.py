@@ -19,10 +19,11 @@ class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "MAX_RECOVERY_ATTEMPTS", 3),
             patch.object(main.asyncio, "sleep", new=AsyncMock()),
         ):
-            await app._recover_voice()
+            recovered = await app._recover_voice_cycle()
 
         self.assertEqual(app._connect_voice.await_count, 3)
         app._schedule_originate.assert_not_called()
+        self.assertFalse(recovered)
 
     async def test_successful_discord_recovery_starts_ami_recovery(self):
         app = object.__new__(main.BridgeApp)
@@ -35,9 +36,10 @@ class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(main.asyncio, "sleep", new=AsyncMock()):
-            await app._recover_voice()
+            recovered = await app._recover_voice_cycle()
 
         app._schedule_originate.assert_called_once_with()
+        self.assertTrue(recovered)
 
     async def test_ami_recovery_is_bounded(self):
         app = object.__new__(main.BridgeApp)
@@ -53,9 +55,36 @@ class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "MAX_RECOVERY_ATTEMPTS", 3),
             patch.object(main.asyncio, "sleep", new=AsyncMock()),
         ):
-            await app._recover_audiosocket()
+            recovered = await app._recover_audiosocket_cycle()
 
         self.assertEqual(app.ami.originate.call_count, 3)
+        self.assertFalse(recovered)
+
+    async def test_discord_recovery_retries_after_cooldown(self):
+        app = object.__new__(main.BridgeApp)
+        app._recover_voice_cycle = AsyncMock(side_effect=[False, True])
+
+        with (
+            patch.object(main, "RECOVERY_COOLDOWN_SECONDS", 300.0),
+            patch.object(main.asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            await app._recover_voice()
+
+        self.assertEqual(app._recover_voice_cycle.await_count, 2)
+        sleep.assert_awaited_once_with(300.0)
+
+    async def test_ami_recovery_retries_after_cooldown(self):
+        app = object.__new__(main.BridgeApp)
+        app._recover_audiosocket_cycle = AsyncMock(side_effect=[False, True])
+
+        with (
+            patch.object(main, "RECOVERY_COOLDOWN_SECONDS", 300.0),
+            patch.object(main.asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            await app._recover_audiosocket()
+
+        self.assertEqual(app._recover_audiosocket_cycle.await_count, 2)
+        sleep.assert_awaited_once_with(300.0)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from audio_bridge import (
 from voice_recv_compat import install_voice_recv_fixes
 
 MAX_RECOVERY_ATTEMPTS = 5
+RECOVERY_COOLDOWN_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,14 @@ class BridgeApp:
             )
 
     async def _recover_voice(self) -> None:
+        while not await self._recover_voice_cycle():
+            print(
+                "Discord voice circuit breaker open; "
+                f"retrying in {RECOVERY_COOLDOWN_SECONDS:.0f}s"
+            )
+            await asyncio.sleep(RECOVERY_COOLDOWN_SECONDS)
+
+    async def _recover_voice_cycle(self) -> bool:
         retry_delay = 1.0
         for attempt in range(1, MAX_RECOVERY_ATTEMPTS + 1):
             try:
@@ -284,8 +293,8 @@ class BridgeApp:
                     print("Discord voice path stopped immediately after connecting")
                     continue
                 self._schedule_originate()
-                return
-        print("Discord voice recovery exhausted; restart the bridge after correcting the cause")
+                return True
+        return False
 
     async def _connect_voice(self) -> None:
         if self.channel is None:
@@ -323,10 +332,18 @@ class BridgeApp:
             )
 
     async def _recover_audiosocket(self) -> None:
+        while not await self._recover_audiosocket_cycle():
+            print(
+                "AMI circuit breaker open; "
+                f"retrying in {RECOVERY_COOLDOWN_SECONDS:.0f}s"
+            )
+            await asyncio.sleep(RECOVERY_COOLDOWN_SECONDS)
+
+    async def _recover_audiosocket_cycle(self) -> bool:
         retry_delay = 1.0
         for attempt in range(1, MAX_RECOVERY_ATTEMPTS + 1):
             if self._audiosocket_connected.is_set():
-                return
+                return True
             try:
                 await asyncio.to_thread(
                     self.ami.originate,
@@ -342,7 +359,7 @@ class BridgeApp:
                 await asyncio.sleep(0.1)
                 if not self._audiosocket_connected.is_set():
                     raise ConnectionError("AudioSocket disconnected immediately after connecting")
-                return
+                return True
             except Exception as error:
                 print(
                     f"AMI originate attempt {attempt}/{MAX_RECOVERY_ATTEMPTS} failed:",
@@ -351,7 +368,7 @@ class BridgeApp:
                 if attempt < MAX_RECOVERY_ATTEMPTS:
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, 30.0)
-        print("AMI recovery exhausted; restart the bridge after correcting the cause")
+        return False
 
 
 intents = discord.Intents.default()
