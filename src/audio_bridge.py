@@ -215,11 +215,11 @@ class AudioSocketWriter:
 
             try:
                 self._send_frame(connection, frame)
-            except (OSError, TimeoutError):
+            except (OSError, TimeoutError, ValueError):
                 self.detach(connection)
                 try:
                     connection.shutdown(socket.SHUT_RDWR)
-                except OSError:
+                except (OSError, ValueError):
                     pass
 
 

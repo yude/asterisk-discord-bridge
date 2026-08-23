@@ -3,6 +3,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -112,6 +113,30 @@ class AudioSocketTests(unittest.TestCase):
             writer.close()
             bridge.close()
             asterisk.close()
+
+    def test_writer_survives_closed_socket_select_race(self):
+        first_bridge, first_asterisk = socket.socketpair()
+        second_bridge, second_asterisk = socket.socketpair()
+        writer = AudioSocketWriter(send_timeout=0.1)
+        try:
+            writer.attach(first_bridge)
+            with patch("audio_bridge.select.select", side_effect=ValueError("closed fd")):
+                self.assertTrue(writer.send_audio(b"\x01\x00" * 160))
+                deadline = time.monotonic() + 1
+                while writer.send_audio(b"\x00\x00") and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+            self.assertTrue(writer._thread.is_alive())
+            writer.attach(second_bridge)
+            self.assertTrue(writer.send_audio(b"\x02\x00" * 160))
+            self.assertEqual(recv_exact(second_asterisk, 3), b"\x10\x01\x40")
+            self.assertEqual(recv_exact(second_asterisk, 320), b"\x02\x00" * 160)
+        finally:
+            writer.close()
+            first_bridge.close()
+            first_asterisk.close()
+            second_bridge.close()
+            second_asterisk.close()
 
 
 class DiscordPcmMixerTests(unittest.TestCase):
