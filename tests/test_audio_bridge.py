@@ -1,5 +1,6 @@
 import socket
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from audio_bridge import (
     DISCORD_FRAME_BYTES,
     AsteriskPcmBuffer,
     AudioSocketWriter,
+    DiscordPcmMixer,
     asterisk_pcm_to_discord,
     discord_pcm_to_asterisk,
     make_audiosocket_audio_frame,
@@ -52,6 +54,14 @@ class AsteriskPcmBufferTests(unittest.TestCase):
         buffer.feed(pcm[100:])
         self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(pcm))
 
+    def test_clear_drops_audio_from_a_previous_connection(self):
+        buffer = AsteriskPcmBuffer()
+        buffer.feed(np.arange(160, dtype="<i2").tobytes())
+
+        buffer.clear()
+
+        self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
+
 
 class AudioSocketTests(unittest.TestCase):
     def test_audio_frame_uses_big_endian_length(self):
@@ -83,8 +93,67 @@ class AudioSocketTests(unittest.TestCase):
             writer.detach(bridge)
             self.assertFalse(writer.send_audio(b"\x00\x00"))
         finally:
+            writer.close()
             bridge.close()
             asterisk.close()
+
+    def test_writer_enqueue_does_not_wait_for_socket(self):
+        bridge, asterisk = socket.socketpair()
+        writer = AudioSocketWriter(max_frames=2, autostart=False)
+        try:
+            writer.attach(bridge)
+            started = time.monotonic()
+            for _ in range(100):
+                writer.send_audio(b"\x00\x00" * 160)
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.1)
+        finally:
+            writer.close()
+            bridge.close()
+            asterisk.close()
+
+
+class DiscordPcmMixerTests(unittest.TestCase):
+    def test_mixes_simultaneous_speakers_into_one_frame(self):
+        output = []
+        mixer = DiscordPcmMixer(lambda pcm: output.append(pcm) or True, autostart=False)
+        try:
+            mixer.push(1, np.full(160, 1000, dtype="<i2").tobytes())
+            mixer.push(2, np.full(160, -250, dtype="<i2").tobytes())
+
+            mixed = mixer.mix_once()
+
+            self.assertEqual(output, [mixed])
+            np.testing.assert_array_equal(
+                np.frombuffer(mixed, dtype="<i2"),
+                np.full(160, 750, dtype="<i2"),
+            )
+        finally:
+            mixer.close()
+
+    def test_clips_mixed_audio_and_emits_only_one_frame_per_tick(self):
+        output = []
+        mixer = DiscordPcmMixer(lambda pcm: output.append(pcm) or True, autostart=False)
+        try:
+            two_frames = np.full(320, 30000, dtype="<i2").tobytes()
+            mixer.push(1, two_frames)
+            mixer.push(2, two_frames)
+
+            first = mixer.mix_once()
+            second = mixer.mix_once()
+
+            self.assertEqual(len(output), 2)
+            np.testing.assert_array_equal(
+                np.frombuffer(first, dtype="<i2"),
+                np.full(160, 32767, dtype="<i2"),
+            )
+            np.testing.assert_array_equal(
+                np.frombuffer(second, dtype="<i2"),
+                np.full(160, 32767, dtype="<i2"),
+            )
+        finally:
+            mixer.close()
 
 
 if __name__ == "__main__":

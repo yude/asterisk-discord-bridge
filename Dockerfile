@@ -15,10 +15,10 @@ ENV PATH="/root/.local/bin:$PATH"
 WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
-RUN uv sync --frozen || uv sync
+RUN uv sync --frozen --no-dev
 
-COPY src/main.py src/audio_bridge.py ./
+COPY src/main.py src/audio_bridge.py src/ami.py src/voice_recv_compat.py ./
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["uv", "run", "main.py"]
+CMD ["uv", "run", "--frozen", "--no-dev", "main.py"]

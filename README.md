@@ -7,7 +7,7 @@ Discord のボイスチャンネルと Asterisk の ConfBridge 会議室を相�
 * Asterisk AudioSocket (8 kHz / mono / signed linear PCM) → Discord (48 kHz / stereo PCM)
 * Discord voice receive (48 kHz / stereo PCM) → Asterisk AudioSocket (8 kHz / mono / signed linear PCM)
 
-Discord からの音声受信には [`discord-ext-voice-recv`](https://github.com/imayhaveborkedit/discord-ext-voice-recv) を使用します。
+Discord からの音声受信には [`discord-ext-voice-recv`](https://github.com/imayhaveborkedit/discord-ext-voice-recv) を使用します。DiscordのDAVEエンドツーエンド暗号化に対応するため、受信フレームの復号と高速再接続時のtransport鍵再同期を `src/voice_recv_compat.py` で補完しています。この互換層は固定済みの `discord-ext-voice-recv` バージョンだけを対象とし、互換性が確認されていないバージョンでは起動を中止します。
 
 ## 前提条件
 
@@ -68,7 +68,7 @@ exten => discord,1,Answer()
 | Conference用extension | `160` |
 | Context | `default` |
 
-異なる番号やcontextを使用する場合は、`src/main.py` のAMI `Originate` 設定も合わせて変更し、イメージを再ビルドしてください。
+異なる番号やcontextを使用する場合は、後述する `.env` の `ASTERISK_CONTEXT`、`ASTERISK_AUDIOSOCKET_EXTENSION`、`ASTERISK_CONFERENCE_EXTENSION` を変更してください。
 
 ### AMIを有効にする
 
@@ -130,8 +130,14 @@ chmod 600 .env
 | `GUILD_ID` | Botを追加したDiscordサーバーID | `123456789012345678` |
 | `VOICE_CHANNEL_ID` | 接続先ボイスチャンネルID | `234567890123456789` |
 | `ASTERISK_AMI_HOST` | AMIの接続先 | 同一ホストでは `127.0.0.1` |
+| `ASTERISK_AMI_PORT` | AMIのTCPポート | `5038` |
 | `ASTERISK_AMI_USER` | `manager.conf` のAMIユーザー名 | `discord` |
 | `ASTERISK_AMI_SECRET` | `manager.conf` の `secret` と同じ値 | 必須・秘密情報 |
+| `ASTERISK_CONTEXT` | AudioSocket側と会議室側のdialplan context | `default` |
+| `ASTERISK_AUDIOSOCKET_EXTENSION` | `AudioSocket()` を実行するextension | `discord` |
+| `ASTERISK_CONFERENCE_EXTENSION` | ConfBridgeへ参加するextension | `160` |
+| `AUDIOSOCKET_LISTEN_HOST` | AudioSocketの待受アドレス | `0.0.0.0` |
+| `AUDIOSOCKET_LISTEN_PORT` | AudioSocketの待受TCPポート | `5000` |
 
 上記のように16進数でAMIパスワードを生成した場合、`.env` の値を引用符で囲む必要はありません。BotトークンとAMIパスワードは、README、ソースコード、Issue、ログへ貼り付けないでください。
 
@@ -150,10 +156,11 @@ docker compose logs -f discord-bridge
 Logged in as ...
 AudioSocket listening on 5000
 Connected to Discord (send and receive)
-AMI login: Response: Success
-AMI originate: Response: Success
+AMI originate accepted; waiting for AudioSocket
 AudioSocket connected: ...
 ```
+
+AMIのログインとOriginate応答は内部で `Response: Success` と `ActionID` を検証します。失敗時やAudioSocket切断時は指数バックオフ付きで最大5回まで再試行します。Discordの送受信処理が停止した場合も、音声接続全体を最大5回まで再作成します。上限へ到達した場合は、設定を直してコンテナを再起動してください。
 
 Botが対象ボイスチャンネルへ参加し、Asteriskの内線 `160` へ参加した端末と双方向に音声が届くことを確認してください。
 
@@ -176,7 +183,7 @@ Botが対象ボイスチャンネルへ参加し、Asteriskの内線 `160` へ�
 docker compose exec asterisk asterisk -rx 'manager show user discord'
 ```
 
-設定を直した後はAsteriskを先に起動し、本リポジトリのディレクトリでブリッジも再起動してください。ブリッジは起動時にAMI Originateを1回実行します。
+設定を直した後はAsteriskを先に起動し、本リポジトリのディレクトリでブリッジも再起動してください。ブリッジはAMI応答とAudioSocket接続を確認し、失敗時は最大5回まで再試行します。
 
 ```console
 docker compose restart discord-bridge
@@ -198,7 +205,23 @@ docker compose exec asterisk asterisk -rx 'dialplan show discord@default'
 
 * Discord→Asteriskが届かない場合は、Botがサーバー側でdeafenされていないか確認します。
 * Asterisk→Discordが届かない場合は、BotのSpeak権限とAsterisk側のAudioSocket接続を確認します。
-* `Discord audio received before AudioSocket connected; dropping it` が表示される場合は、AMI OriginateまたはAsteriskのdialplan設定を確認します。
+* `AMI originate accepted; waiting for AudioSocket` の後に接続されない場合は、AMI OriginateまたはAsteriskのdialplan設定を確認します。
+
+### 復旧試行が上限へ到達する
+
+`Discord voice recovery exhausted` または `AMI recovery exhausted` が表示された場合、無制限な再接続や発呼を防ぐため自動復旧を停止しています。直前に出力されたエラーとDiscord権限、AMI設定、dialplanを確認し、原因を修正してからブリッジコンテナを再起動してください。
+
+## 開発時の検証
+
+ロック済みの開発依存関係をインストールし、実行時処理を含むユニットテストと静的解析を実行します。
+
+```console
+uv sync --frozen --dev
+uv run python -m unittest discover -s tests -v
+uv run ruff check src tests
+```
+
+GitHub ActionsでもDockerイメージをビルドする前に同じ検証を実行します。
 
 ## 別ホストで動かす場合
 
@@ -220,6 +243,7 @@ AudioSocketには認証機構がなく、AMIには通話を開始できる権限
 * [Discord: Building your first Discord Bot](https://docs.discord.com/developers/quick-start/getting-started)
 * [Discord: OAuth2 and Permissions](https://docs.discord.com/developers/platform/oauth2-and-permissions)
 * [Discord: Permissions](https://docs.discord.com/developers/topics/permissions)
+* [Discord: Voice Connections / DAVE protocol](https://docs.discord.com/developers/topics/voice-connections#end-to-end-encryption-dave-protocol)
 * [Asterisk: AudioSocket()](https://docs.asterisk.org/Latest_API/API_Documentation/Dialplan_Applications/AudioSocket/)
 * [Asterisk: AudioSocket protocol](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/)
 * [Asterisk: Manager Interface](https://docs.asterisk.org/Configuration/Interfaces/Asterisk-Manager-Interface-AMI/The-Asterisk-Manager-TCP-IP-API/)

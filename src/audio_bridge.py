@@ -1,5 +1,9 @@
+import queue
+import select
 import socket
 import threading
+import time
+from collections.abc import Callable
 
 import numpy as np
 
@@ -76,6 +80,10 @@ class AsteriskPcmBuffer:
                 overflow += overflow % 2
                 del self._buffer[:overflow]
 
+    def clear(self) -> None:
+        with self._lock:
+            self._buffer.clear()
+
     def read_discord_frame(self) -> bytes:
         with self._lock:
             if len(self._buffer) < ASTERISK_FRAME_BYTES:
@@ -87,20 +95,45 @@ class AsteriskPcmBuffer:
 
 
 class AudioSocketWriter:
-    """Thread-safe writer for the current full-duplex AudioSocket connection."""
+    """Queue AudioSocket frames without blocking Discord's receive thread."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        max_frames: int = 50,
+        send_timeout: float = 1.0,
+        autostart: bool = True,
+    ):
         self._connection: socket.socket | None = None
         self._lock = threading.Lock()
+        self._generation = 0
+        self._queue: queue.Queue[tuple[int, bytes]] = queue.Queue(maxsize=max_frames)
+        self._send_timeout = send_timeout
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"audiosocket-writer-{id(self):x}",
+        )
+        if autostart:
+            self.start()
+
+    def start(self) -> None:
+        if not self._thread.is_alive():
+            self._thread.start()
 
     def attach(self, connection: socket.socket) -> None:
         with self._lock:
+            self._generation += 1
             self._connection = connection
+            generation = self._generation
+        self._discard_stale_frames(generation)
 
     def detach(self, connection: socket.socket) -> None:
         with self._lock:
             if self._connection is connection:
                 self._connection = None
+                self._generation += 1
 
     def send_audio(self, pcm: bytes) -> bool:
         if not pcm:
@@ -108,13 +141,164 @@ class AudioSocketWriter:
 
         frame = make_audiosocket_audio_frame(pcm)
         with self._lock:
-            connection = self._connection
-            if connection is None:
+            if self._connection is None:
                 return False
+            generation = self._generation
+
+        item = (generation, frame)
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            # Keep latency bounded: real-time audio is more useful than an old
+            # frame that has been waiting behind a stalled connection.
             try:
-                connection.sendall(frame)
-            except OSError:
-                if self._connection is connection:
-                    self._connection = None
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
                 return False
         return True
+
+    def close(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+
+    def _discard_stale_frames(self, generation: int) -> None:
+        retained: list[tuple[int, bytes]] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] == generation:
+                retained.append(item)
+        for item in retained:
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                break
+
+    def _current_connection(self, generation: int) -> socket.socket | None:
+        with self._lock:
+            if generation != self._generation:
+                return None
+            return self._connection
+
+    def _send_frame(self, connection: socket.socket, frame: bytes) -> None:
+        view = memoryview(frame)
+        deadline = time.monotonic() + self._send_timeout
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("AudioSocket write timed out")
+            _, writable, exceptional = select.select([], [connection], [connection], remaining)
+            if exceptional or not writable:
+                raise TimeoutError("AudioSocket write timed out")
+            sent = connection.send(view)
+            if sent <= 0:
+                raise ConnectionError("AudioSocket connection closed while writing")
+            view = view[sent:]
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                generation, frame = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            connection = self._current_connection(generation)
+            if connection is None:
+                continue
+
+            try:
+                self._send_frame(connection, frame)
+            except (OSError, TimeoutError):
+                self.detach(connection)
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+class DiscordPcmMixer:
+    """Mix Discord speakers into one paced 8 kHz AudioSocket stream."""
+
+    def __init__(
+        self,
+        output: Callable[[bytes], bool],
+        *,
+        frame_interval: float = 0.02,
+        max_buffered_frames: int = 50,
+        autostart: bool = True,
+    ):
+        self._output = output
+        self._frame_interval = frame_interval
+        self._max_buffered_bytes = ASTERISK_FRAME_BYTES * max_buffered_frames
+        self._buffers: dict[int, bytearray] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"discord-mixer-{id(self):x}",
+        )
+        if autostart:
+            self.start()
+
+    def start(self) -> None:
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def push(self, speaker_id: int, pcm: bytes) -> None:
+        pcm = pcm[: len(pcm) - (len(pcm) % 2)]
+        if not pcm:
+            return
+
+        with self._lock:
+            speaker_buffer = self._buffers.setdefault(speaker_id, bytearray())
+            speaker_buffer.extend(pcm)
+            overflow = len(speaker_buffer) - self._max_buffered_bytes
+            if overflow > 0:
+                overflow += overflow % 2
+                del speaker_buffer[:overflow]
+
+    def mix_once(self) -> bytes | None:
+        frames: list[np.ndarray] = []
+        with self._lock:
+            inactive: list[int] = []
+            for speaker_id, speaker_buffer in self._buffers.items():
+                if len(speaker_buffer) >= ASTERISK_FRAME_BYTES:
+                    pcm = bytes(speaker_buffer[:ASTERISK_FRAME_BYTES])
+                    del speaker_buffer[:ASTERISK_FRAME_BYTES]
+                    frames.append(np.frombuffer(pcm, dtype="<i2").astype(np.int32))
+                if not speaker_buffer:
+                    inactive.append(speaker_id)
+            for speaker_id in inactive:
+                del self._buffers[speaker_id]
+
+        if not frames:
+            return None
+
+        mixed = np.sum(frames, axis=0, dtype=np.int32)
+        pcm = np.clip(mixed, -32768, 32767).astype("<i2").tobytes()
+        self._output(pcm)
+        return pcm
+
+    def close(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+
+    def _run(self) -> None:
+        next_frame = time.monotonic()
+        while not self._stop.is_set():
+            next_frame += self._frame_interval
+            self.mix_once()
+            delay = max(0.0, next_frame - time.monotonic())
+            if self._stop.wait(delay):
+                break
+            if delay == 0.0:
+                next_frame = time.monotonic()

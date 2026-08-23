@@ -4,10 +4,18 @@ version = "0.1.0"
 requires-python = ">=3.12"
 
 dependencies = [
-    "discord.py",
+    "discord.py==2.7.1",
     "discord-ext-voice-recv==0.5.2a179",
     "numpy",
     "opuslib",
     "pynacl",
-    "davey",
+    "davey==0.1.6",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff==0.12.12",
+]
+
+[tool.ruff]
+line-length = 100
