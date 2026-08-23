@@ -62,7 +62,9 @@ def discord_pcm_to_asterisk(pcm: bytes) -> bytes:
 class AsteriskPcmBuffer:
     """Thread-safe buffer that presents AudioSocket PCM as Discord frames."""
 
-    def __init__(self, max_frames: int = 200):
+    def __init__(self, max_frames: int = 10):
+        if max_frames < 1:
+            raise ValueError("max_frames must be at least one")
         self._buffer = bytearray()
         self._max_bytes = ASTERISK_FRAME_BYTES * max_frames
         self._lock = threading.Lock()
@@ -88,6 +90,14 @@ class AsteriskPcmBuffer:
         with self._lock:
             if len(self._buffer) < ASTERISK_FRAME_BYTES:
                 return b"\x00" * DISCORD_FRAME_BYTES
+
+            # Audio cannot be played faster than real time. If more than one
+            # complete frame accumulated, skip stale frames rather than keeping
+            # the Discord side permanently behind the live conversation.
+            complete_frames = len(self._buffer) // ASTERISK_FRAME_BYTES
+            if complete_frames > 1:
+                stale_bytes = (complete_frames - 1) * ASTERISK_FRAME_BYTES
+                del self._buffer[:stale_bytes]
             pcm = bytes(self._buffer[:ASTERISK_FRAME_BYTES])
             del self._buffer[:ASTERISK_FRAME_BYTES]
 
@@ -100,10 +110,12 @@ class AudioSocketWriter:
     def __init__(
         self,
         *,
-        max_frames: int = 50,
+        max_frames: int = 5,
         send_timeout: float = 1.0,
         autostart: bool = True,
     ):
+        if max_frames < 1:
+            raise ValueError("max_frames must be at least one")
         self._connection: socket.socket | None = None
         self._lock = threading.Lock()
         self._generation = 0
@@ -149,12 +161,9 @@ class AudioSocketWriter:
         try:
             self._queue.put_nowait(item)
         except queue.Full:
-            # Keep latency bounded: real-time audio is more useful than an old
-            # frame that has been waiting behind a stalled connection.
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                pass
+            # Once the latency budget is exhausted, catch up to live audio in
+            # one step instead of staying a full queue behind indefinitely.
+            self._clear_queue()
             try:
                 self._queue.put_nowait(item)
             except queue.Full:
@@ -180,6 +189,13 @@ class AudioSocketWriter:
                 self._queue.put_nowait(item)
             except queue.Full:
                 break
+
+    def _clear_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
 
     def _current_connection(self, generation: int) -> socket.socket | None:
         with self._lock:
@@ -231,9 +247,11 @@ class DiscordPcmMixer:
         output: Callable[[bytes], bool],
         *,
         frame_interval: float = 0.02,
-        max_buffered_frames: int = 50,
+        max_buffered_frames: int = 5,
         autostart: bool = True,
     ):
+        if max_buffered_frames < 1:
+            raise ValueError("max_buffered_frames must be at least one")
         self._output = output
         self._frame_interval = frame_interval
         self._max_buffered_bytes = ASTERISK_FRAME_BYTES * max_buffered_frames
@@ -262,8 +280,9 @@ class DiscordPcmMixer:
             speaker_buffer.extend(pcm)
             overflow = len(speaker_buffer) - self._max_buffered_bytes
             if overflow > 0:
-                overflow += overflow % 2
-                del speaker_buffer[:overflow]
+                # Preserve only the newest frame. Keeping a full buffer would
+                # make the speaker remain delayed after the stall has ended.
+                del speaker_buffer[:-ASTERISK_FRAME_BYTES]
 
     def mix_once(self) -> bytes | None:
         frames: list[np.ndarray] = []

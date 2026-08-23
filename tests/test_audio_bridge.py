@@ -63,6 +63,14 @@ class AsteriskPcmBufferTests(unittest.TestCase):
 
         self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
 
+    def test_read_skips_stale_frames_after_a_stall(self):
+        buffer = AsteriskPcmBuffer()
+        stale = np.full(160, 1, dtype="<i2").tobytes()
+        latest = np.full(160, 2, dtype="<i2").tobytes()
+        buffer.feed(stale + latest)
+
+        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(latest))
+
 
 class AudioSocketTests(unittest.TestCase):
     def test_audio_frame_uses_big_endian_length(self):
@@ -138,6 +146,23 @@ class AudioSocketTests(unittest.TestCase):
             second_bridge.close()
             second_asterisk.close()
 
+    def test_writer_drops_the_entire_backlog_when_latency_budget_is_full(self):
+        bridge, asterisk = socket.socketpair()
+        writer = AudioSocketWriter(max_frames=2, autostart=False)
+        try:
+            writer.attach(bridge)
+            self.assertTrue(writer.send_audio(b"\x01\x00" * 160))
+            self.assertTrue(writer.send_audio(b"\x02\x00" * 160))
+            self.assertTrue(writer.send_audio(b"\x03\x00" * 160))
+            writer.start()
+
+            self.assertEqual(recv_exact(asterisk, 3), b"\x10\x01\x40")
+            self.assertEqual(recv_exact(asterisk, 320), b"\x03\x00" * 160)
+        finally:
+            writer.close()
+            bridge.close()
+            asterisk.close()
+
 
 class DiscordPcmMixerTests(unittest.TestCase):
     def test_mixes_simultaneous_speakers_into_one_frame(self):
@@ -176,6 +201,32 @@ class DiscordPcmMixerTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 np.frombuffer(second, dtype="<i2"),
                 np.full(160, 32767, dtype="<i2"),
+            )
+        finally:
+            mixer.close()
+
+    def test_speaker_buffer_catches_up_after_exceeding_latency_budget(self):
+        output = []
+        mixer = DiscordPcmMixer(
+            lambda pcm: output.append(pcm) or True,
+            max_buffered_frames=2,
+            autostart=False,
+        )
+        try:
+            pcm = np.concatenate(
+                [
+                    np.full(160, 1, dtype="<i2"),
+                    np.full(160, 2, dtype="<i2"),
+                    np.full(160, 3, dtype="<i2"),
+                ]
+            ).tobytes()
+            mixer.push(1, pcm)
+
+            mixed = mixer.mix_once()
+
+            np.testing.assert_array_equal(
+                np.frombuffer(mixed, dtype="<i2"),
+                np.full(160, 3, dtype="<i2"),
             )
         finally:
             mixer.close()
