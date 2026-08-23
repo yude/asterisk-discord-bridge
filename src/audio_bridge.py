@@ -62,11 +62,16 @@ def discord_pcm_to_asterisk(pcm: bytes) -> bytes:
 class AsteriskPcmBuffer:
     """Thread-safe buffer that presents AudioSocket PCM as Discord frames."""
 
-    def __init__(self, max_frames: int = 10):
+    def __init__(self, max_frames: int = 5, target_frames: int | None = None):
         if max_frames < 1:
             raise ValueError("max_frames must be at least one")
+        if target_frames is None:
+            target_frames = min(2, max_frames)
+        if not 1 <= target_frames <= max_frames:
+            raise ValueError("target_frames must be between one and max_frames")
         self._buffer = bytearray()
-        self._max_bytes = ASTERISK_FRAME_BYTES * max_frames
+        self._max_frames = max_frames
+        self._target_frames = target_frames
         self._lock = threading.Lock()
 
     def feed(self, pcm: bytes) -> None:
@@ -77,10 +82,10 @@ class AsteriskPcmBuffer:
 
         with self._lock:
             self._buffer.extend(pcm)
-            overflow = len(self._buffer) - self._max_bytes
-            if overflow > 0:
-                overflow += overflow % 2
-                del self._buffer[:overflow]
+            complete_frames = len(self._buffer) // ASTERISK_FRAME_BYTES
+            if complete_frames > self._max_frames:
+                stale_frames = complete_frames - self._target_frames
+                del self._buffer[: stale_frames * ASTERISK_FRAME_BYTES]
 
     def clear(self) -> None:
         with self._lock:
@@ -91,13 +96,6 @@ class AsteriskPcmBuffer:
             if len(self._buffer) < ASTERISK_FRAME_BYTES:
                 return b"\x00" * DISCORD_FRAME_BYTES
 
-            # Audio cannot be played faster than real time. If more than one
-            # complete frame accumulated, skip stale frames rather than keeping
-            # the Discord side permanently behind the live conversation.
-            complete_frames = len(self._buffer) // ASTERISK_FRAME_BYTES
-            if complete_frames > 1:
-                stale_bytes = (complete_frames - 1) * ASTERISK_FRAME_BYTES
-                del self._buffer[:stale_bytes]
             pcm = bytes(self._buffer[:ASTERISK_FRAME_BYTES])
             del self._buffer[:ASTERISK_FRAME_BYTES]
 

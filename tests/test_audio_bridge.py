@@ -63,13 +63,22 @@ class AsteriskPcmBufferTests(unittest.TestCase):
 
         self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
 
-    def test_read_skips_stale_frames_after_a_stall(self):
+    def test_read_preserves_a_small_jitter_window(self):
         buffer = AsteriskPcmBuffer()
-        stale = np.full(160, 1, dtype="<i2").tobytes()
-        latest = np.full(160, 2, dtype="<i2").tobytes()
-        buffer.feed(stale + latest)
+        first = np.full(160, 1, dtype="<i2").tobytes()
+        second = np.full(160, 2, dtype="<i2").tobytes()
+        buffer.feed(first + second)
 
-        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(latest))
+        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(first))
+        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(second))
+
+    def test_feed_catches_up_after_exceeding_the_high_watermark(self):
+        buffer = AsteriskPcmBuffer(max_frames=3, target_frames=2)
+        frames = [np.full(160, value, dtype="<i2").tobytes() for value in range(1, 5)]
+        buffer.feed(b"".join(frames))
+
+        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(frames[2]))
+        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(frames[3]))
 
 
 class AudioSocketTests(unittest.TestCase):
