@@ -23,6 +23,9 @@ from voice_recv_compat import install_voice_recv_fixes
 
 MAX_RECOVERY_ATTEMPTS = 5
 RECOVERY_COOLDOWN_SECONDS = 300.0
+AUDIOSOCKET_HANDSHAKE_TIMEOUT_SECONDS = 5.0
+AUDIOSOCKET_UUID_TYPE = 0x01
+AUDIOSOCKET_UUID_BYTES = 16
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,8 @@ class AudioSocketServer:
         self._connection_lock = threading.Lock()
         self._connection: socket.socket | None = None
         self._connection_generation = 0
+        self._pending_connection: socket.socket | None = None
+        self._next_connection_generation = 0
         self._server: socket.socket | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="audiosocket-receiver")
 
@@ -128,10 +133,13 @@ class AudioSocketServer:
         with self._connection_lock:
             server = self._server
             connection = self._connection
+            pending_connection = self._pending_connection
         if server is not None:
             server.close()
         if connection is not None:
             self._shutdown(connection)
+        if pending_connection is not None:
+            self._shutdown(pending_connection)
         if self._thread.is_alive():
             self._thread.join(timeout)
 
@@ -169,17 +177,14 @@ class AudioSocketServer:
 
     def _activate(self, connection: socket.socket, address) -> None:
         with self._connection_lock:
-            previous = self._connection
-            self._connection_generation += 1
-            generation = self._connection_generation
-            self._connection = connection
-        if previous is not None:
-            self._shutdown(previous)
+            previous_pending = self._pending_connection
+            self._next_connection_generation += 1
+            generation = self._next_connection_generation
+            self._pending_connection = connection
+        if previous_pending is not None:
+            self._shutdown(previous_pending)
 
-        print("AudioSocket connected:", address)
-        self._pcm_buffer.clear()
-        self._writer.attach(connection)
-        self._on_connected(generation)
+        print("AudioSocket connection candidate:", address)
         threading.Thread(
             target=self._handle_connection,
             args=(connection, generation),
@@ -189,11 +194,21 @@ class AudioSocketServer:
 
     def _handle_connection(self, connection: socket.socket, generation: int) -> None:
         try:
+            connection.settimeout(AUDIOSOCKET_HANDSHAKE_TIMEOUT_SECONDS)
+            if not self._receive_handshake(connection):
+                return
+            if not self._promote(connection, generation):
+                return
+            connection.settimeout(None)
             self._receive(connection)
+        except TimeoutError:
+            print("AudioSocket handshake timed out")
         except OSError as error:
             print("AudioSocket error:", error)
         finally:
             with self._connection_lock:
+                if self._pending_connection is connection:
+                    self._pending_connection = None
                 is_active = (
                     self._connection is connection
                     and self._connection_generation == generation
@@ -205,6 +220,23 @@ class AudioSocketServer:
             if is_active:
                 self._on_disconnected(generation)
                 print("AudioSocket disconnected")
+
+    def _promote(self, connection: socket.socket, generation: int) -> bool:
+        with self._connection_lock:
+            if self._pending_connection is not connection:
+                return False
+            previous = self._connection
+            self._pending_connection = None
+            self._connection = connection
+            self._connection_generation = generation
+
+        if previous is not None:
+            self._shutdown(previous)
+        self._pcm_buffer.clear()
+        self._writer.attach(connection)
+        self._on_connected(generation)
+        print(f"AudioSocket handshake complete (generation {generation})")
+        return True
 
     @staticmethod
     def _shutdown(connection: socket.socket) -> None:
@@ -229,6 +261,24 @@ class AudioSocketServer:
                 self._pcm_buffer.feed(payload)
             elif message_type == 0xFF:
                 print("AudioSocket peer reported error:", payload.hex())
+
+    @staticmethod
+    def _receive_handshake(connection: socket.socket) -> bool:
+        header = recv_exact(connection, 3)
+        if header is None:
+            return False
+        message_type = header[0]
+        length = int.from_bytes(header[1:], "big")
+        payload = recv_exact(connection, length)
+        if payload is None:
+            return False
+        if message_type != AUDIOSOCKET_UUID_TYPE or length != AUDIOSOCKET_UUID_BYTES:
+            print(
+                "AudioSocket rejected invalid handshake:"
+                f" type=0x{message_type:02x}, length={length}"
+            )
+            return False
+        return True
 
 
 class BridgeApp:

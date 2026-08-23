@@ -13,7 +13,9 @@ from audio_bridge import AsteriskPcmBuffer, AudioSocketWriter, recv_exact
 
 
 class AudioSocketServerTests(unittest.TestCase):
-    def test_new_connection_replaces_an_idle_connection(self):
+    UUID_FRAME = b"\x01\x00\x10" + bytes(range(16))
+
+    def test_new_valid_connection_replaces_current_connection(self):
         pcm_buffer = AsteriskPcmBuffer()
         writer = AudioSocketWriter()
         connected = []
@@ -31,9 +33,11 @@ class AudioSocketServerTests(unittest.TestCase):
             server.start()
             server.wait_until_ready()
             first = socket.create_connection(("127.0.0.1", server.port))
+            first.sendall(self.UUID_FRAME)
             self._wait_until(lambda: len(connected) == 1)
 
             second = socket.create_connection(("127.0.0.1", server.port))
+            second.sendall(self.UUID_FRAME)
             self._wait_until(lambda: len(connected) == 2)
 
             first.settimeout(1)
@@ -48,6 +52,66 @@ class AudioSocketServerTests(unittest.TestCase):
                 first.close()
             if second is not None:
                 second.close()
+            server.close()
+            writer.close()
+
+    def test_idle_candidate_times_out_without_becoming_connected(self):
+        pcm_buffer = AsteriskPcmBuffer()
+        writer = AudioSocketWriter()
+        connected = []
+        disconnected = []
+        server = main.AudioSocketServer(
+            "127.0.0.1",
+            0,
+            pcm_buffer,
+            writer,
+            connected.append,
+            disconnected.append,
+        )
+        candidate = None
+        try:
+            with patch.object(main, "AUDIOSOCKET_HANDSHAKE_TIMEOUT_SECONDS", 0.05):
+                server.start()
+                server.wait_until_ready()
+                candidate = socket.create_connection(("127.0.0.1", server.port))
+                candidate.settimeout(1)
+                self.assertEqual(candidate.recv(1), b"")
+
+            self.assertEqual(connected, [])
+            self.assertEqual(disconnected, [])
+            self.assertFalse(writer.send_audio(b"\x00\x00" * 160))
+        finally:
+            if candidate is not None:
+                candidate.close()
+            server.close()
+            writer.close()
+
+    def test_candidate_without_uuid_is_rejected(self):
+        pcm_buffer = AsteriskPcmBuffer()
+        writer = AudioSocketWriter()
+        connected = []
+        server = main.AudioSocketServer(
+            "127.0.0.1",
+            0,
+            pcm_buffer,
+            writer,
+            connected.append,
+            lambda generation: None,
+        )
+        candidate = None
+        try:
+            server.start()
+            server.wait_until_ready()
+            candidate = socket.create_connection(("127.0.0.1", server.port))
+            candidate.sendall(b"\x10\x00\x02\x00\x00")
+            candidate.settimeout(1)
+
+            self.assertEqual(candidate.recv(1), b"")
+            self.assertEqual(connected, [])
+            self.assertFalse(writer.send_audio(b"\x00\x00" * 160))
+        finally:
+            if candidate is not None:
+                candidate.close()
             server.close()
             writer.close()
 
