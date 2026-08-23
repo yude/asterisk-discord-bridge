@@ -23,8 +23,8 @@ class AudioSocketServerTests(unittest.TestCase):
             0,
             pcm_buffer,
             writer,
-            lambda: connected.append(True),
-            lambda: disconnected.append(True),
+            connected.append,
+            disconnected.append,
         )
         first = second = None
         try:
@@ -42,6 +42,7 @@ class AudioSocketServerTests(unittest.TestCase):
             self.assertEqual(recv_exact(second, 3), b"\x10\x01\x40")
             self.assertEqual(recv_exact(second, 320), b"\x02\x00" * 160)
             self.assertEqual(disconnected, [])
+            self.assertEqual(connected, [1, 2])
         finally:
             if first is not None:
                 first.close()
@@ -59,6 +60,18 @@ class AudioSocketServerTests(unittest.TestCase):
 
 
 class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_audiosocket_disconnect_does_not_clear_new_connection(self):
+        app = object.__new__(main.BridgeApp)
+        app._audiosocket_connected = main.asyncio.Event()
+        app._audiosocket_generation = 0
+        app._schedule_originate = Mock()
+
+        app._handle_audiosocket_connected(2)
+        app._handle_audiosocket_disconnected(1)
+
+        self.assertTrue(app._audiosocket_connected.is_set())
+        app._schedule_originate.assert_not_called()
+
     async def test_discord_recovery_is_bounded(self):
         app = object.__new__(main.BridgeApp)
         app._connect_voice = AsyncMock(side_effect=RuntimeError("voice unavailable"))

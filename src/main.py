@@ -110,6 +110,7 @@ class AudioSocketServer:
         self._stop = threading.Event()
         self._connection_lock = threading.Lock()
         self._connection: socket.socket | None = None
+        self._connection_generation = 0
         self._server: socket.socket | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="audiosocket-receiver")
 
@@ -166,6 +167,8 @@ class AudioSocketServer:
     def _activate(self, connection: socket.socket, address) -> None:
         with self._connection_lock:
             previous = self._connection
+            self._connection_generation += 1
+            generation = self._connection_generation
             self._connection = connection
         if previous is not None:
             self._shutdown(previous)
@@ -173,28 +176,31 @@ class AudioSocketServer:
         print("AudioSocket connected:", address)
         self._pcm_buffer.clear()
         self._writer.attach(connection)
-        self._on_connected()
+        self._on_connected(generation)
         threading.Thread(
             target=self._handle_connection,
-            args=(connection,),
+            args=(connection, generation),
             daemon=True,
             name=f"audiosocket-connection-{id(connection):x}",
         ).start()
 
-    def _handle_connection(self, connection: socket.socket) -> None:
+    def _handle_connection(self, connection: socket.socket, generation: int) -> None:
         try:
             self._receive(connection)
         except OSError as error:
             print("AudioSocket error:", error)
         finally:
             with self._connection_lock:
-                is_active = self._connection is connection
+                is_active = (
+                    self._connection is connection
+                    and self._connection_generation == generation
+                )
                 if is_active:
                     self._connection = None
             self._writer.detach(connection)
             connection.close()
             if is_active:
-                self._on_disconnected()
+                self._on_disconnected(generation)
                 print("AudioSocket disconnected")
 
     @staticmethod
@@ -243,6 +249,7 @@ class BridgeApp:
         self._voice_recovery_task: asyncio.Task | None = None
         self._originate_task: asyncio.Task | None = None
         self._audiosocket_connected = asyncio.Event()
+        self._audiosocket_generation = 0
         self.server = AudioSocketServer(
             settings.audiosocket_host,
             settings.audiosocket_port,
@@ -270,15 +277,29 @@ class BridgeApp:
         await asyncio.to_thread(self.server.wait_until_ready)
         self._schedule_voice_recovery()
 
-    def _notify_audiosocket_connected(self) -> None:
+    def _notify_audiosocket_connected(self, generation: int) -> None:
         if self.loop is not None:
-            self.loop.call_soon_threadsafe(self._audiosocket_connected.set)
+            self.loop.call_soon_threadsafe(
+                self._handle_audiosocket_connected,
+                generation,
+            )
 
-    def _notify_audiosocket_disconnected(self) -> None:
+    def _handle_audiosocket_connected(self, generation: int) -> None:
+        if generation < self._audiosocket_generation:
+            return
+        self._audiosocket_generation = generation
+        self._audiosocket_connected.set()
+
+    def _notify_audiosocket_disconnected(self, generation: int) -> None:
         if self.loop is not None:
-            self.loop.call_soon_threadsafe(self._handle_audiosocket_disconnected)
+            self.loop.call_soon_threadsafe(
+                self._handle_audiosocket_disconnected,
+                generation,
+            )
 
-    def _handle_audiosocket_disconnected(self) -> None:
+    def _handle_audiosocket_disconnected(self, generation: int) -> None:
+        if generation != self._audiosocket_generation:
+            return
         self._audiosocket_connected.clear()
         self._schedule_originate()
 
