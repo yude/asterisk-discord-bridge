@@ -60,6 +60,19 @@ class AudioSocketServerTests(unittest.TestCase):
 
 
 class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_failure_closes_discord_client(self):
+        bridge = SimpleNamespace(start=AsyncMock(side_effect=RuntimeError("bind failed")))
+        client = SimpleNamespace(user="bridge", close=AsyncMock())
+
+        with (
+            patch.object(main, "bridge", bridge),
+            patch.object(main, "client", client),
+            self.assertRaisesRegex(RuntimeError, "bind failed"),
+        ):
+            await main.on_ready()
+
+        client.close.assert_awaited_once_with()
+
     async def test_stale_audiosocket_disconnect_does_not_clear_new_connection(self):
         app = object.__new__(main.BridgeApp)
         app._audiosocket_connected = main.asyncio.Event()

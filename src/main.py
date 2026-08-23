@@ -136,6 +136,7 @@ class AudioSocketServer:
             self._thread.join(timeout)
 
     def _run(self) -> None:
+        server: socket.socket | None = None
         try:
             server = socket.socket()
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -143,6 +144,8 @@ class AudioSocketServer:
             server.listen(5)
             server.settimeout(0.5)
         except BaseException as error:
+            if server is not None:
+                server.close()
             self._startup_error = error
             self._ready.set()
             return
@@ -458,7 +461,14 @@ async def on_ready() -> None:
     if bridge is None:
         raise RuntimeError("Bridge application was not initialized")
     print("Logged in as", client.user)
-    await bridge.start()
+    try:
+        await bridge.start()
+    except Exception:
+        # discord.py logs event-handler failures and otherwise keeps the client
+        # alive. Close it explicitly so the process exits and the container's
+        # restart policy can retry a failed AudioSocket initialization.
+        await client.close()
+        raise
 
 
 def main() -> None:
