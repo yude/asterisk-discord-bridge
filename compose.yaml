@@ -2,12 +2,10 @@ services:
   discord-bridge:
     build:
       context: .
-      dockerfile: Dockerfile.discord-bridge
+      dockerfile: Dockerfile
     restart: always
     env_file:
       - .env
-    depends_on:
-      - asterisk
     network_mode: host
     environment:
       - TZ=Asia/Tokyo

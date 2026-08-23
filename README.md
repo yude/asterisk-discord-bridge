@@ -1,45 +1,228 @@
 # asterisk-discord-bridge
 
-Discord のボイスチャンネルを Asterisk の Conference room に相互ブリッジします
+Discord のボイスチャンネルと Asterisk の ConfBridge 会議室を相互接続するブリッジです。
 
 音声は次の両方向に変換されます。
 
 * Asterisk AudioSocket (8 kHz / mono / signed linear PCM) → Discord (48 kHz / stereo PCM)
 * Discord voice receive (48 kHz / stereo PCM) → Asterisk AudioSocket (8 kHz / mono / signed linear PCM)
 
-Discord からの音声受信には `discord-ext-voice-recv` を使用します。Bot には対象ボイスチャンネルの「接続」と「発言」権限が必要です。
+Discord からの音声受信には [`discord-ext-voice-recv`](https://github.com/imayhaveborkedit/discord-ext-voice-recv) を使用します。
 
-## 設定
+## 前提条件
 
-* Asterisk は構築済みとします。
-    * Conference room の構築までは https://github.com/tkytel/asterisk-quickstart を参照してください
-    * Conference room に default context の 160 番でアクセスできる前提で開発しています。必要のある場合は main.py を修正してください。
-* Discord bot 向け AudioSocket 送信口としての extension を作成します。
-    * tkytel/asterisk-quickstart では config/extension/internal/discord.conf として以下の内容を記述すれば動作します。
-        ```
-        exten => discord,1,Answer()
-            same => n,Set(UUID=${UUID()})
-            same => n,AudioSocket(${UUID},127.0.0.1:5000)
-            same => n,Hangup()
-        ```
-        * `127.0.0.1:5000` は asterisk-discord-bridge によって作成される socket の受け口を指定してください
-* Asterisk の Conferece room に bot を参加させるため、Asterisk CLI をこのコンテナから操作できる必要があります
-    * `/etc/asterisk/manager.conf` に以下の内容を記述してください
-        * asterisk-quickstart では config/manager.conf に記述し compose.yaml で /etc/asterisk/manager.conf に volume mount してください
-        * 内容
-            ```
-            [general]
-            enabled = yes
-            port = 5038
-            bindaddr = 0.0.0.0
+* Linux ホスト上で Docker Engine と Docker Compose v2 が利用できること
+* Asterisk 18 以降が動作していること
+    * `AudioSocket()` は Asterisk 18.0.0 から利用できます。
+    * このREADMEでは [`tkytel/asterisk-quickstart`](https://github.com/tkytel/asterisk-quickstart) を同じホストで動かす構成を例にします。
+* Asterisk の `default` context の内線 `160` で ConfBridge 会議室へ参加できること
+* Discord サーバーへBotを追加できる権限があること
+* TCPポート `5000` を別のプロセスが使用していないこと
 
-            [discord]
-            secret = <AMI_PASSWORD; 適宜生成>
-            read = all
-            write = all
-            ```
-        * また、上記で設定した認証情報を asterisk-discord-bridge に環境変数経由で読み込ませてください
-            * `.env.example` を参照してください
+本リポジトリのCompose設定と `asterisk-quickstart` は、どちらも `network_mode: host` を使用します。以下の手順は、両コンテナを同じLinuxホストで動かすことを前提としています。
+
+## 1. Discord Botを準備する
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) でApplicationを作成し、Botユーザーを追加します。
+2. Botページでトークンを発行します。トークンはパスワードと同様に扱い、Gitへコミットしないでください。
+3. InstallationページでGuild Installに `bot` scopeを追加し、次の権限を付けて対象サーバーへインストールします。
+    * View Channels
+    * Connect
+    * Speak
+4. Discordクライアントの「ユーザー設定」→「詳細設定」から開発者モードを有効にします。
+5. 対象サーバーを右クリックして「サーバーIDをコピー」、対象ボイスチャンネルを右クリックして「チャンネルIDをコピー」を実行します。
+
+特権Gateway Intentの有効化は不要です。チャンネル単位の権限上書きでも、Botに上記3権限が許可されていることを確認してください。
+
+## 2. Asteriskを設定する
+
+### 必要なモジュールを確認する
+
+`asterisk-quickstart` のディレクトリで、AudioSocketとUUID関数が利用できることを確認します。
+
+```console
+docker compose exec asterisk asterisk -rx 'module show like app_audiosocket.so'
+docker compose exec asterisk asterisk -rx 'module show like func_uuid.so'
+```
+
+各コマンドでモジュールが1件表示される必要があります。表示されない場合は、使用中のAsteriskイメージがAudioSocketを含むAsterisk 18以降か確認してください。
+
+### AudioSocket用のdialplanを追加する
+
+`asterisk-quickstart/config/extensions/internal/discord.conf` を作成します。
+
+```asterisk
+exten => discord,1,Answer()
+    same => n,Set(UUID=${UUID()})
+    same => n,AudioSocket(${UUID},127.0.0.1:5000)
+    same => n,Hangup()
+```
+
+`127.0.0.1:5000` は、このブリッジが待ち受けるAudioSocketのアドレスです。同一ホストで `network_mode: host` を使用する場合は変更不要です。
+
+`asterisk-quickstart` では `default` context の内線 `160` がConfBridge会議室へ接続されます。このブリッジも次の値を前提としています。
+
+| 項目 | 既定値 |
+|---|---|
+| AudioSocket用extension | `discord` |
+| Conference用extension | `160` |
+| Context | `default` |
+
+異なる番号やcontextを使用する場合は、`src/main.py` のAMI `Originate` 設定も合わせて変更し、イメージを再ビルドしてください。
+
+### AMIを有効にする
+
+ブリッジはAsterisk Manager Interface (AMI) の `Originate` actionを使用して、AudioSocket側とConfBridge側の通話を開始します。
+
+まず、AMI用のパスワードを生成します。出力された値は、後ほど `.env` の `ASTERISK_AMI_SECRET` にも設定します。
+
+```console
+openssl rand -hex 32
+```
+
+`asterisk-quickstart/config/manager.conf` を、生成したパスワードを使って作成します。
+
+```ini
+[general]
+enabled = yes
+webenabled = no
+port = 5038
+bindaddr = 127.0.0.1
+
+[discord]
+secret = <十分に長いランダムなパスワード>
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read = none
+write = originate
+```
+
+次に、`asterisk-quickstart/compose.yaml` の `asterisk.volumes` に以下を追加します。
+
+```yaml
+- ./config/manager.conf:/etc/asterisk/manager.conf:ro
+```
+
+設定を反映するため、Asteriskコンテナを再作成します。
+
+```console
+docker compose up -d --force-recreate asterisk
+```
+
+AMIのTCPポート `5038` はインターネットへ公開しないでください。この手順では同一ホストからのみ接続できるよう、待受アドレスとAMIユーザーのACLをloopbackに制限しています。
+
+## 3. ブリッジを設定する
+
+本リポジトリをcloneし、環境変数ファイルを作成します。
+
+```console
+git clone https://github.com/yude/asterisk-discord-bridge.git
+cd asterisk-discord-bridge
+cp .env.example .env
+chmod 600 .env
+```
+
+`.env` に次の値を設定します。
+
+| 変数 | 内容 | 例 |
+|---|---|---|
+| `DISCORD_TOKEN` | Developer Portalで発行したBotトークン | 必須・秘密情報 |
+| `GUILD_ID` | Botを追加したDiscordサーバーID | `123456789012345678` |
+| `VOICE_CHANNEL_ID` | 接続先ボイスチャンネルID | `234567890123456789` |
+| `ASTERISK_AMI_HOST` | AMIの接続先 | 同一ホストでは `127.0.0.1` |
+| `ASTERISK_AMI_USER` | `manager.conf` のAMIユーザー名 | `discord` |
+| `ASTERISK_AMI_SECRET` | `manager.conf` の `secret` と同じ値 | 必須・秘密情報 |
+
+上記のように16進数でAMIパスワードを生成した場合、`.env` の値を引用符で囲む必要はありません。BotトークンとAMIパスワードは、README、ソースコード、Issue、ログへ貼り付けないでください。
+
+## 4. 起動する
+
+Asteriskが起動済みであることを確認してから、ブリッジをビルドして起動します。
+
+```console
+docker compose up -d --build
+docker compose logs -f discord-bridge
+```
+
+正常に起動すると、概ね次のログが順に表示されます。
+
+```text
+Logged in as ...
+AudioSocket listening on 5000
+Connected to Discord (send and receive)
+AMI login: Response: Success
+AMI originate: Response: Success
+AudioSocket connected: ...
+```
+
+Botが対象ボイスチャンネルへ参加し、Asteriskの内線 `160` へ参加した端末と双方向に音声が届くことを確認してください。
+
+## 動作確認とトラブルシューティング
+
+### BotがDiscordへ参加しない
+
+* `GUILD_ID` と `VOICE_CHANNEL_ID` が正しいか確認します。
+* Botが対象サーバーへGuild Installされているか確認します。
+* 対象ボイスチャンネルでView Channels、Connect、Speakが許可されているか確認します。
+* Botがサーバーミュートまたはサーバーdeafenされていないか確認します。
+
+### AMI loginまたはoriginateが失敗する
+
+* `.env` と `manager.conf` のユーザー名・パスワードが一致しているか確認します。
+* Asteriskコンテナへ `manager.conf` がマウントされ、再作成済みか確認します。
+* `asterisk-quickstart` のディレクトリで、Asterisk側のAMIユーザーを確認します。
+
+```console
+docker compose exec asterisk asterisk -rx 'manager show user discord'
+```
+
+設定を直した後はAsteriskを先に起動し、本リポジトリのディレクトリでブリッジも再起動してください。ブリッジは起動時にAMI Originateを1回実行します。
+
+```console
+docker compose restart discord-bridge
+```
+
+### AudioSocketが接続されない
+
+* ブリッジログに `AudioSocket listening on 5000` があるか確認します。
+* `asterisk-quickstart` のディレクトリで、Asterisk側のdialplanが読み込まれているか確認します。
+
+```console
+docker compose exec asterisk asterisk -rx 'dialplan show discord@default'
+```
+
+* TCPポート `5000` を他のプロセスが使用していないか確認します。
+* `discord.conf` の接続先と、ブリッジを実行しているホストが一致しているか確認します。
+
+### 片方向だけ音声が届く
+
+* Discord→Asteriskが届かない場合は、Botがサーバー側でdeafenされていないか確認します。
+* Asterisk→Discordが届かない場合は、BotのSpeak権限とAsterisk側のAudioSocket接続を確認します。
+* `Discord audio received before AudioSocket connected; dropping it` が表示される場合は、AMI OriginateまたはAsteriskのdialplan設定を確認します。
+
+## 別ホストで動かす場合
+
+Asteriskとブリッジを別ホストで動かす場合は、次の変更が必要です。
+
+* `AudioSocket()` の接続先をブリッジホストのIPアドレスへ変更する
+* `ASTERISK_AMI_HOST` をAsteriskホストのIPアドレスへ変更する
+* `manager.conf` の `bindaddr`、`permit`、ホスト側ファイアウォールを送信元IPに限定して変更する
+* TCP `5000` と `5038` の疎通を確認する
+
+AudioSocketには認証機構がなく、AMIには通話を開始できる権限があります。どちらのポートもインターネットへ直接公開しないでください。
+
+## プライバシー
+
+このブリッジはDiscordボイスチャンネルの音声を電話会議へ転送します。利用前に、Discord側と電話側の参加者へ音声が相互転送されることを明示してください。
+
+## 参考資料
+
+* [Discord: Building your first Discord Bot](https://docs.discord.com/developers/quick-start/getting-started)
+* [Discord: OAuth2 and Permissions](https://docs.discord.com/developers/platform/oauth2-and-permissions)
+* [Discord: Permissions](https://docs.discord.com/developers/topics/permissions)
+* [Asterisk: AudioSocket()](https://docs.asterisk.org/Latest_API/API_Documentation/Dialplan_Applications/AudioSocket/)
+* [Asterisk: AudioSocket protocol](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/)
+* [Asterisk: Manager Interface](https://docs.asterisk.org/Configuration/Interfaces/Asterisk-Manager-Interface-AMI/The-Asterisk-Manager-TCP-IP-API/)
 
 ## License
 
