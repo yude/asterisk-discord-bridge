@@ -1,4 +1,6 @@
 import sys
+import socket
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +9,53 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import main
+from audio_bridge import AsteriskPcmBuffer, AudioSocketWriter, recv_exact
+
+
+class AudioSocketServerTests(unittest.TestCase):
+    def test_new_connection_replaces_an_idle_connection(self):
+        pcm_buffer = AsteriskPcmBuffer()
+        writer = AudioSocketWriter()
+        connected = []
+        disconnected = []
+        server = main.AudioSocketServer(
+            "127.0.0.1",
+            0,
+            pcm_buffer,
+            writer,
+            lambda: connected.append(True),
+            lambda: disconnected.append(True),
+        )
+        first = second = None
+        try:
+            server.start()
+            server.wait_until_ready()
+            first = socket.create_connection(("127.0.0.1", server.port))
+            self._wait_until(lambda: len(connected) == 1)
+
+            second = socket.create_connection(("127.0.0.1", server.port))
+            self._wait_until(lambda: len(connected) == 2)
+
+            first.settimeout(1)
+            self.assertEqual(first.recv(1), b"")
+            self.assertTrue(writer.send_audio(b"\x02\x00" * 160))
+            self.assertEqual(recv_exact(second, 3), b"\x10\x01\x40")
+            self.assertEqual(recv_exact(second, 320), b"\x02\x00" * 160)
+            self.assertEqual(disconnected, [])
+        finally:
+            if first is not None:
+                first.close()
+            if second is not None:
+                second.close()
+            server.close()
+            writer.close()
+
+    def _wait_until(self, condition, timeout: float = 1.0):
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() >= deadline:
+                self.fail("condition was not met before timeout")
+            time.sleep(0.01)
 
 
 class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):

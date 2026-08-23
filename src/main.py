@@ -107,6 +107,10 @@ class AudioSocketServer:
         self._on_disconnected = on_disconnected
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
+        self._stop = threading.Event()
+        self._connection_lock = threading.Lock()
+        self._connection: socket.socket | None = None
+        self._server: socket.socket | None = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="audiosocket-receiver")
 
     def start(self) -> None:
@@ -118,35 +122,87 @@ class AudioSocketServer:
         if self._startup_error is not None:
             raise RuntimeError("AudioSocket server failed to start") from self._startup_error
 
+    def close(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        with self._connection_lock:
+            server = self._server
+            connection = self._connection
+        if server is not None:
+            server.close()
+        if connection is not None:
+            self._shutdown(connection)
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+
     def _run(self) -> None:
         try:
             server = socket.socket()
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((self.host, self.port))
             server.listen(5)
+            server.settimeout(0.5)
         except BaseException as error:
             self._startup_error = error
             self._ready.set()
             return
 
+        with self._connection_lock:
+            self._server = server
+        self.port = server.getsockname()[1]
         self._ready.set()
         print(f"AudioSocket listening on {self.host}:{self.port}")
         with server:
-            while True:
-                connection, address = server.accept()
-                print("AudioSocket connected:", address)
-                self._pcm_buffer.clear()
-                self._writer.attach(connection)
-                self._on_connected()
+            while not self._stop.is_set():
                 try:
-                    self._receive(connection)
+                    connection, address = server.accept()
+                except TimeoutError:
+                    continue
                 except OSError as error:
-                    print("AudioSocket error:", error)
-                finally:
-                    self._writer.detach(connection)
-                    connection.close()
-                    self._on_disconnected()
-                    print("AudioSocket disconnected")
+                    if not self._stop.is_set():
+                        print("AudioSocket accept error:", error)
+                    return
+                self._activate(connection, address)
+
+    def _activate(self, connection: socket.socket, address) -> None:
+        with self._connection_lock:
+            previous = self._connection
+            self._connection = connection
+        if previous is not None:
+            self._shutdown(previous)
+
+        print("AudioSocket connected:", address)
+        self._pcm_buffer.clear()
+        self._writer.attach(connection)
+        self._on_connected()
+        threading.Thread(
+            target=self._handle_connection,
+            args=(connection,),
+            daemon=True,
+            name=f"audiosocket-connection-{id(connection):x}",
+        ).start()
+
+    def _handle_connection(self, connection: socket.socket) -> None:
+        try:
+            self._receive(connection)
+        except OSError as error:
+            print("AudioSocket error:", error)
+        finally:
+            with self._connection_lock:
+                is_active = self._connection is connection
+                if is_active:
+                    self._connection = None
+            self._writer.detach(connection)
+            connection.close()
+            if is_active:
+                self._on_disconnected()
+                print("AudioSocket disconnected")
+
+    @staticmethod
+    def _shutdown(connection: socket.socket) -> None:
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
 
     def _receive(self, connection: socket.socket) -> None:
         while True:
