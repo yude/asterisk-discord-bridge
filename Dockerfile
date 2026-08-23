@@ -17,7 +17,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock* ./
 RUN uv sync --frozen || uv sync
 
-COPY src/main.py .
+COPY src/main.py src/audio_bridge.py ./
 
 ENV PYTHONUNBUFFERED=1
 

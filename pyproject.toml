@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 
 dependencies = [
     "discord.py",
+    "discord-ext-voice-recv==0.5.2a179",
     "numpy",
     "opuslib",
     "pynacl",

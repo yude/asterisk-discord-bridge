@@ -2,6 +2,13 @@
 
 Discord のボイスチャンネルを Asterisk の Conference room に相互ブリッジします
 
+音声は次の両方向に変換されます。
+
+* Asterisk AudioSocket (8 kHz / mono / signed linear PCM) → Discord (48 kHz / stereo PCM)
+* Discord voice receive (48 kHz / stereo PCM) → Asterisk AudioSocket (8 kHz / mono / signed linear PCM)
+
+Discord からの音声受信には `discord-ext-voice-recv` を使用します。Bot には対象ボイスチャンネルの「接続」と「発言」権限が必要です。
+
 ## 設定
 
 * Asterisk は構築済みとします。

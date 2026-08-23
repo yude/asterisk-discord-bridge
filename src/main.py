@@ -1,10 +1,19 @@
-import discord
+import asyncio
+import os
 import socket
 import threading
-import asyncio
-import numpy as np
-import os
+
+import discord
 import discord.opus
+from discord.ext import voice_recv
+
+from audio_bridge import (
+    AUDIOSOCKET_AUDIO_TYPE,
+    AsteriskPcmBuffer,
+    AudioSocketWriter,
+    discord_pcm_to_asterisk,
+    recv_exact,
+)
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
@@ -22,9 +31,12 @@ client = discord.Client(intents=intents)
 if not discord.opus.is_loaded():
     discord.opus.load_opus("libopus.so.0")
 
-pcm_queue = asyncio.Queue(maxsize=200)
+asterisk_pcm = AsteriskPcmBuffer()
+audiosocket_writer = AudioSocketWriter()
 
 _originate_done = False
+_bridge_started = False
+
 
 def join_confbridge():
     global _originate_done
@@ -33,26 +45,20 @@ def join_confbridge():
         return
 
     _originate_done = True
-
     print("Joining ConfBridge via AMI...")
 
     try:
-        s = socket.socket()
-        s.connect((ASTERISK_AMI_HOST, 5038))
-
-        # Login
-        login_cmd = f"""Action: Login
+        with socket.create_connection((ASTERISK_AMI_HOST, 5038), timeout=10) as ami:
+            login_cmd = f"""Action: Login
 Username: {ASTERISK_AMI_USER}
 Secret: {ASTERISK_AMI_SECRET}
 
 """
-        s.sendall(login_cmd.encode())
+            ami.sendall(login_cmd.encode())
+            response = ami.recv(1024)
+            print("AMI login:", response.decode(errors="ignore"))
 
-        resp = s.recv(1024)
-        print("AMI login:", resp.decode(errors="ignore"))
-
-        # Originate
-        originate_cmd = """Action: Originate
+            originate_cmd = """Action: Originate
 Channel: Local/discord@default
 Exten: 160
 Context: default
@@ -60,109 +66,118 @@ Priority: 1
 Async: true
 
 """
-        s.sendall(originate_cmd.encode())
+            ami.sendall(originate_cmd.encode())
+            response = ami.recv(1024)
+            print("AMI originate:", response.decode(errors="ignore"))
+            ami.sendall(b"Action: Logoff\n\n")
+    except OSError as error:
+        _originate_done = False
+        print("AMI error:", error)
 
-        resp = s.recv(1024)
-        print("AMI originate:", resp.decode(errors="ignore"))
-
-        # Logoff
-        s.sendall(b"Action: Logoff\n\n")
-        s.close()
-
-    except Exception as e:
-        print("AMI error:", e)
-
-
-def recv_exact(conn, size):
-    buf = b""
-    while len(buf) < size:
-        chunk = conn.recv(size - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
 
 def asterisk_receiver():
-    s = socket.socket()
-    s.bind((AST_HOST, AST_PORT))
-    s.listen(5)
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((AST_HOST, AST_PORT))
+        server.listen(5)
+        print("AudioSocket listening on", AST_PORT)
 
-    print("AudioSocket listening on", AST_PORT)
+        while True:
+            connection, address = server.accept()
+            print("AudioSocket connected:", address)
+            audiosocket_writer.attach(connection)
 
-    while True:
-        conn, addr = s.accept()
-        print("AudioSocket connected:", addr)
+            try:
+                while True:
+                    header = recv_exact(connection, 3)
+                    if header is None:
+                        break
 
-        try:
-            while True:
-                header = recv_exact(conn, 3)
-                if not header:
-                    break
+                    message_type = header[0]
+                    length = int.from_bytes(header[1:], "big")
+                    if message_type == 0x00:
+                        break
 
-                typ = header[0]
-                length = int.from_bytes(header[1:], "big")
+                    payload = recv_exact(connection, length)
+                    if payload is None:
+                        break
 
-                payload = recv_exact(conn, length)
-                if not payload:
-                    break
+                    if message_type == AUDIOSOCKET_AUDIO_TYPE:
+                        asterisk_pcm.feed(payload)
+                    elif message_type == 0xFF:
+                        print("AudioSocket peer reported error:", payload.hex())
+            except OSError as error:
+                print("AudioSocket error:", error)
+            finally:
+                audiosocket_writer.detach(connection)
+                connection.close()
+                print("AudioSocket disconnected")
 
-                if typ == 0x10:
-                    if not pcm_queue.full():
-                        asyncio.run_coroutine_threadsafe(
-                            pcm_queue.put(payload),
-                            client.loop
-                        )
-        except Exception as e:
-            print("AudioSocket error:", e)
-        finally:
-            print("AudioSocket disconnected")
-            conn.close()
-
-FRAME_SIZE = 3840  # 48kHz stereo 20ms
 
 class AsteriskAudio(discord.AudioSource):
     def read(self):
-        try:
-            data = pcm_queue.get_nowait()
-        except:
-            return b"\x00" * FRAME_SIZE
-
-        pcm = np.frombuffer(data, dtype=np.int16)
-
-        # 8kHz → 48kHz
-        pcm48 = np.repeat(pcm, 6)
-
-        # mono → stereo
-        pcm48 = np.repeat(pcm48[:, None], 2, axis=1).flatten()
-
-        out = pcm48.tobytes()
-
-        if len(out) < FRAME_SIZE:
-            out += b"\x00" * (FRAME_SIZE - len(out))
-
-        return out[:FRAME_SIZE]
+        return asterisk_pcm.read_discord_frame()
 
     def is_opus(self):
         return False
 
+
+class DiscordAudioSink(voice_recv.AudioSink):
+    def __init__(self):
+        super().__init__()
+        self._warned_no_audiosocket = False
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user, data: voice_recv.VoiceData) -> None:
+        # Unknown senders and bots are excluded to avoid feeding the bridge's own
+        # transmission back into Asterisk.
+        if user is None or user.bot or data.pcm is None:
+            return
+
+        pcm = discord_pcm_to_asterisk(data.pcm)
+        sent = audiosocket_writer.send_audio(pcm)
+        if not sent and not self._warned_no_audiosocket:
+            print("Discord audio received before AudioSocket connected; dropping it")
+            self._warned_no_audiosocket = True
+        elif sent:
+            self._warned_no_audiosocket = False
+
+    def cleanup(self) -> None:
+        pass
+
+
+def voice_receive_stopped(error: Exception | None) -> None:
+    if error is not None:
+        print("Discord voice receive stopped:", error)
+
+
 @client.event
 async def on_ready():
-    print("Logged in")
+    global _bridge_started
+    if _bridge_started:
+        return
+    _bridge_started = True
 
+    print("Logged in as", client.user)
     guild = client.get_guild(GUILD_ID)
+    if guild is None:
+        raise RuntimeError(f"Discord guild {GUILD_ID} was not found")
     channel = guild.get_channel(VOICE_CHANNEL_ID)
+    if channel is None:
+        raise LookupError(f"Discord channel {VOICE_CHANNEL_ID} was not found")
+    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        raise TypeError(f"Discord channel {VOICE_CHANNEL_ID} is not a voice channel")
 
+    threading.Thread(target=asterisk_receiver, daemon=True).start()
     await asyncio.sleep(2)
 
-    vc = await channel.connect()
-    vc.play(AsteriskAudio())
+    voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+    voice_client.play(AsteriskAudio())
+    voice_client.listen(DiscordAudioSink(), after=voice_receive_stopped)
+    print("Connected to Discord (send and receive)")
 
-    print("Connected to Discord")
-
-    # AudioSocket受信開始
-    threading.Thread(target=asterisk_receiver, daemon=True).start()
-
-    # ConfBridge参加
     await asyncio.sleep(1)
     join_confbridge()
 
