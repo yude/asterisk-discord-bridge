@@ -72,6 +72,7 @@ class AsteriskPcmBuffer:
         self._buffer = bytearray()
         self._max_frames = max_frames
         self._target_frames = target_frames
+        self._buffering = True
         self._lock = threading.Lock()
 
     def feed(self, pcm: bytes) -> None:
@@ -90,10 +91,17 @@ class AsteriskPcmBuffer:
     def clear(self) -> None:
         with self._lock:
             self._buffer.clear()
+            self._buffering = True
 
     def read_discord_frame(self) -> bytes:
         with self._lock:
-            if len(self._buffer) < ASTERISK_FRAME_BYTES:
+            complete_frames = len(self._buffer) // ASTERISK_FRAME_BYTES
+            if self._buffering:
+                if complete_frames < self._target_frames:
+                    return b"\x00" * DISCORD_FRAME_BYTES
+                self._buffering = False
+            elif complete_frames == 0:
+                self._buffering = True
                 return b"\x00" * DISCORD_FRAME_BYTES
 
             pcm = bytes(self._buffer[:ASTERISK_FRAME_BYTES])

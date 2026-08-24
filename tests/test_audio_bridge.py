@@ -47,7 +47,7 @@ class AudioConversionTests(unittest.TestCase):
 class AsteriskPcmBufferTests(unittest.TestCase):
     def test_aggregates_partial_audiosocket_messages(self):
         pcm = np.arange(160, dtype="<i2").tobytes()
-        buffer = AsteriskPcmBuffer()
+        buffer = AsteriskPcmBuffer(target_frames=1)
         buffer.feed(pcm[:100])
 
         self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
@@ -57,9 +57,13 @@ class AsteriskPcmBufferTests(unittest.TestCase):
 
     def test_clear_drops_audio_from_a_previous_connection(self):
         buffer = AsteriskPcmBuffer()
-        buffer.feed(np.arange(160, dtype="<i2").tobytes())
+        previous = np.arange(320, dtype="<i2").tobytes()
+        current = np.arange(160, dtype="<i2").tobytes()
+        buffer.feed(previous)
+        buffer.read_discord_frame()
 
         buffer.clear()
+        buffer.feed(current)
 
         self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
 
@@ -79,6 +83,22 @@ class AsteriskPcmBufferTests(unittest.TestCase):
 
         self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(frames[2]))
         self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(frames[3]))
+
+    def test_underflow_rebuffers_before_resuming_playback(self):
+        buffer = AsteriskPcmBuffer(max_frames=5, target_frames=2)
+        first = np.full(160, 1, dtype="<i2").tobytes()
+        second = np.full(160, 2, dtype="<i2").tobytes()
+        third = np.full(160, 3, dtype="<i2").tobytes()
+        buffer.feed(first + second)
+        buffer.read_discord_frame()
+        buffer.read_discord_frame()
+
+        self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
+        buffer.feed(third)
+        self.assertEqual(buffer.read_discord_frame(), b"\x00" * DISCORD_FRAME_BYTES)
+
+        buffer.feed(first)
+        self.assertEqual(buffer.read_discord_frame(), asterisk_pcm_to_discord(third))
 
 
 class AudioSocketTests(unittest.TestCase):
