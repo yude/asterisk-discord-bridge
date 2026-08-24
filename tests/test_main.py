@@ -11,7 +11,37 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import main
-from audio_bridge import AsteriskPcmBuffer, AudioSocketWriter, recv_exact
+from audio_bridge import (
+    AsteriskPcmBuffer,
+    AudioSocketWriter,
+    discord_pcm_to_asterisk,
+    recv_exact,
+)
+
+
+class DiscordAudioSinkTests(unittest.TestCase):
+    def test_forwards_audio_from_another_bot(self):
+        mixer = Mock()
+        sink = main.DiscordAudioSink(mixer, bridge_user_id=1)
+        pcm = b"\x00\x00" * 1920
+
+        sink.write(
+            SimpleNamespace(id=2, bot=True),
+            SimpleNamespace(pcm=pcm),
+        )
+
+        mixer.push.assert_called_once_with(2, discord_pcm_to_asterisk(pcm))
+
+    def test_drops_only_the_bridge_users_audio(self):
+        mixer = Mock()
+        sink = main.DiscordAudioSink(mixer, bridge_user_id=1)
+
+        sink.write(
+            SimpleNamespace(id=1, bot=True),
+            SimpleNamespace(pcm=b"\x00\x00" * 1920),
+        )
+
+        mixer.push.assert_not_called()
 
 
 class AudioSocketServerTests(unittest.TestCase):

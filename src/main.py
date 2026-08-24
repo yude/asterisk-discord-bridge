@@ -93,17 +93,18 @@ class AsteriskAudio(discord.AudioSource):
 
 
 class DiscordAudioSink(voice_recv.AudioSink):
-    def __init__(self, mixer: DiscordPcmMixer):
+    def __init__(self, mixer: DiscordPcmMixer, bridge_user_id: int):
         super().__init__()
         self._mixer = mixer
+        self._bridge_user_id = bridge_user_id
 
     def wants_opus(self) -> bool:
         return False
 
     def write(self, user, data: voice_recv.VoiceData) -> None:
-        # Unknown senders and bots are excluded to avoid feeding the bridge's
-        # own transmission back into Asterisk.
-        if user is None or user.bot or data.pcm is None:
+        # Exclude only this bridge's transmission. Other bots are legitimate
+        # voice-channel participants and should be forwarded to Asterisk.
+        if user is None or user.id == self._bridge_user_id or data.pcm is None:
             return
         self._mixer.push(user.id, discord_pcm_to_asterisk(data.pcm))
 
@@ -475,6 +476,9 @@ class BridgeApp:
     async def _connect_voice(self) -> None:
         if self.channel is None:
             raise RuntimeError("Discord voice channel has not been resolved")
+        bot_user = self.client.user
+        if bot_user is None:
+            raise RuntimeError("Discord bot user has not been resolved")
         self._voice_generation += 1
         generation = self._voice_generation
         old_voice_client = self.voice_client
@@ -489,7 +493,7 @@ class BridgeApp:
                 after=lambda error: self._voice_path_stopped(generation, "transmit", error),
             )
             voice_client.listen(
-                DiscordAudioSink(self.mixer),
+                DiscordAudioSink(self.mixer, bot_user.id),
                 after=lambda error: self._voice_path_stopped(generation, "receive", error),
             )
         except BaseException:
