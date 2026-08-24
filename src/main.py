@@ -28,22 +28,11 @@ AUDIOSOCKET_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 AUDIOSOCKET_UUID_TYPE = 0x01
 AUDIOSOCKET_UUID_BYTES = 16
 AUDIOSOCKET_ACCEPT_RETRY_DELAY_SECONDS = 0.5
-RETRYABLE_AUDIOSOCKET_ACCEPT_ERRNOS = frozenset(
+FATAL_AUDIOSOCKET_ACCEPT_ERRNOS = frozenset(
     {
-        errno.EAGAIN,
-        errno.EWOULDBLOCK,
-        errno.EINTR,
-        errno.ECONNABORTED,
-        errno.EPROTO,
-        errno.ENETDOWN,
-        errno.ENOPROTOOPT,
-        errno.EHOSTDOWN,
-        errno.ENONET,
-        errno.EHOSTUNREACH,
-        errno.EOPNOTSUPP,
-        errno.ENETUNREACH,
-        errno.ENOBUFS,
-        errno.ENOMEM,
+        errno.EBADF,
+        errno.EINVAL,
+        errno.ENOTSOCK,
     }
 )
 
@@ -195,14 +184,14 @@ class AudioSocketServer:
                 except OSError as error:
                     if self._stop.is_set():
                         return
-                    if error.errno in RETRYABLE_AUDIOSOCKET_ACCEPT_ERRNOS:
-                        print("AudioSocket accept error; retrying:", error)
-                        if self._stop.wait(AUDIOSOCKET_ACCEPT_RETRY_DELAY_SECONDS):
-                            return
-                        continue
-                    print("AudioSocket listener failed:", error)
-                    self._on_failed(error)
-                    return
+                    if error.errno in FATAL_AUDIOSOCKET_ACCEPT_ERRNOS:
+                        print("AudioSocket listener failed:", error)
+                        self._on_failed(error)
+                        return
+                    print("AudioSocket accept error; retrying:", error)
+                    if self._stop.wait(AUDIOSOCKET_ACCEPT_RETRY_DELAY_SECONDS):
+                        return
+                    continue
                 self._activate(connection, address)
 
     def _activate(self, connection: socket.socket, address) -> None:

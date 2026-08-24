@@ -147,17 +147,21 @@ class AudioSocketServerTests(unittest.TestCase):
             server.close()
             writer.close()
 
-    def test_transient_accept_error_is_retried(self):
+    def test_connection_scoped_accept_errors_are_retried(self):
         listener = MagicMock()
         listener.getsockname.return_value = ("127.0.0.1", 5000)
         release_accept = threading.Event()
         accept_calls = 0
+        retryable_errors = [
+            OSError(errno.ECONNABORTED, "connection aborted"),
+            OSError(errno.EPERM, "firewall rejected connection"),
+        ]
 
         def accept():
             nonlocal accept_calls
             accept_calls += 1
-            if accept_calls == 1:
-                raise OSError(errno.ECONNABORTED, "connection aborted")
+            if accept_calls <= len(retryable_errors):
+                raise retryable_errors[accept_calls - 1]
             release_accept.wait(1)
             raise OSError(errno.EBADF, "listener closed")
 
@@ -181,7 +185,7 @@ class AudioSocketServerTests(unittest.TestCase):
             ):
                 server.start()
                 server.wait_until_ready()
-                self._wait_until(lambda: accept_calls >= 2)
+                self._wait_until(lambda: accept_calls >= 3)
 
             self.assertEqual(failed, [])
         finally:
