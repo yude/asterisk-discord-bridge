@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import socket
 import threading
@@ -26,6 +27,25 @@ RECOVERY_COOLDOWN_SECONDS = 300.0
 AUDIOSOCKET_HANDSHAKE_TIMEOUT_SECONDS = 5.0
 AUDIOSOCKET_UUID_TYPE = 0x01
 AUDIOSOCKET_UUID_BYTES = 16
+AUDIOSOCKET_ACCEPT_RETRY_DELAY_SECONDS = 0.5
+RETRYABLE_AUDIOSOCKET_ACCEPT_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        errno.EINTR,
+        errno.ECONNABORTED,
+        errno.EPROTO,
+        errno.ENETDOWN,
+        errno.ENOPROTOOPT,
+        errno.EHOSTDOWN,
+        errno.ENONET,
+        errno.EHOSTUNREACH,
+        errno.EOPNOTSUPP,
+        errno.ENETUNREACH,
+        errno.ENOBUFS,
+        errno.ENOMEM,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -101,6 +121,7 @@ class AudioSocketServer:
         writer: AudioSocketWriter,
         on_connected,
         on_disconnected,
+        on_failed=None,
     ):
         self.host = host
         self.port = port
@@ -108,6 +129,7 @@ class AudioSocketServer:
         self._writer = writer
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
+        self._on_failed = on_failed or (lambda error: None)
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
         self._stop = threading.Event()
@@ -170,8 +192,15 @@ class AudioSocketServer:
                 except TimeoutError:
                     continue
                 except OSError as error:
-                    if not self._stop.is_set():
-                        print("AudioSocket accept error:", error)
+                    if self._stop.is_set():
+                        return
+                    if error.errno in RETRYABLE_AUDIOSOCKET_ACCEPT_ERRNOS:
+                        print("AudioSocket accept error; retrying:", error)
+                        if self._stop.wait(AUDIOSOCKET_ACCEPT_RETRY_DELAY_SECONDS):
+                            return
+                        continue
+                    print("AudioSocket listener failed:", error)
+                    self._on_failed(error)
                     return
                 self._activate(connection, address)
 
@@ -301,6 +330,7 @@ class BridgeApp:
         self._voice_generation = 0
         self._voice_recovery_task: asyncio.Task | None = None
         self._originate_task: asyncio.Task | None = None
+        self._shutdown_task: asyncio.Task | None = None
         self._audiosocket_connected = asyncio.Event()
         self._audiosocket_generation = 0
         self.server = AudioSocketServer(
@@ -310,6 +340,7 @@ class BridgeApp:
             self.writer,
             self._notify_audiosocket_connected,
             self._notify_audiosocket_disconnected,
+            self._notify_audiosocket_failed,
         )
 
     async def start(self) -> None:
@@ -355,6 +386,21 @@ class BridgeApp:
             return
         self._audiosocket_connected.clear()
         self._schedule_originate()
+
+    def _notify_audiosocket_failed(self, error: OSError) -> None:
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(
+                self._handle_audiosocket_failed,
+                error,
+            )
+
+    def _handle_audiosocket_failed(self, error: OSError) -> None:
+        print("AudioSocket listener stopped; shutting down:", error)
+        if self._shutdown_task is None or self._shutdown_task.done():
+            self._shutdown_task = asyncio.create_task(
+                self.client.close(),
+                name="audiosocket-listener-failure-shutdown",
+            )
 
     def _voice_path_stopped(
         self,

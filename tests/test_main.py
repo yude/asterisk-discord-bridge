@@ -1,10 +1,12 @@
+import errno
 import sys
 import socket
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -115,6 +117,73 @@ class AudioSocketServerTests(unittest.TestCase):
             server.close()
             writer.close()
 
+    def test_transient_accept_error_is_retried(self):
+        listener = MagicMock()
+        listener.getsockname.return_value = ("127.0.0.1", 5000)
+        release_accept = threading.Event()
+        accept_calls = 0
+
+        def accept():
+            nonlocal accept_calls
+            accept_calls += 1
+            if accept_calls == 1:
+                raise OSError(errno.ECONNABORTED, "connection aborted")
+            release_accept.wait(1)
+            raise OSError(errno.EBADF, "listener closed")
+
+        listener.accept.side_effect = accept
+        listener.close.side_effect = release_accept.set
+        failed = []
+        writer = AudioSocketWriter()
+        server = main.AudioSocketServer(
+            "127.0.0.1",
+            5000,
+            AsteriskPcmBuffer(),
+            writer,
+            lambda generation: None,
+            lambda generation: None,
+            failed.append,
+        )
+        try:
+            with (
+                patch.object(main.socket, "socket", return_value=listener),
+                patch.object(main, "AUDIOSOCKET_ACCEPT_RETRY_DELAY_SECONDS", 0),
+            ):
+                server.start()
+                server.wait_until_ready()
+                self._wait_until(lambda: accept_calls >= 2)
+
+            self.assertEqual(failed, [])
+        finally:
+            server.close()
+            writer.close()
+
+    def test_fatal_accept_error_notifies_bridge(self):
+        listener = MagicMock()
+        listener.getsockname.return_value = ("127.0.0.1", 5000)
+        listener.accept.side_effect = OSError(errno.EBADF, "invalid listener")
+        failed = []
+        writer = AudioSocketWriter()
+        server = main.AudioSocketServer(
+            "127.0.0.1",
+            5000,
+            AsteriskPcmBuffer(),
+            writer,
+            lambda generation: None,
+            lambda generation: None,
+            failed.append,
+        )
+        try:
+            with patch.object(main.socket, "socket", return_value=listener):
+                server.start()
+                server.wait_until_ready()
+                self._wait_until(lambda: len(failed) == 1)
+
+            self.assertEqual(failed[0].errno, errno.EBADF)
+        finally:
+            server.close()
+            writer.close()
+
     def _wait_until(self, condition, timeout: float = 1.0):
         deadline = time.monotonic() + timeout
         while not condition():
@@ -124,6 +193,16 @@ class AudioSocketServerTests(unittest.TestCase):
 
 
 class BridgeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fatal_audiosocket_listener_error_closes_client(self):
+        app = object.__new__(main.BridgeApp)
+        app.client = SimpleNamespace(close=AsyncMock())
+        app._shutdown_task = None
+
+        app._handle_audiosocket_failed(OSError(errno.EBADF, "invalid listener"))
+        await main.asyncio.sleep(0)
+
+        app.client.close.assert_awaited_once_with()
+
     async def test_startup_failure_closes_discord_client(self):
         bridge = SimpleNamespace(start=AsyncMock(side_effect=RuntimeError("bind failed")))
         client = SimpleNamespace(user="bridge", close=AsyncMock())
